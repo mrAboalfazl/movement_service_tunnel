@@ -1,0 +1,97 @@
+#!/bin/bash
+set -e
+
+SRC_DIR="/tmp/udp_import"
+DST_DIR="/etc/systemd/system"
+
+echo "========== UDP IMPORT START =========="
+
+# 1. check source
+if [ ! -d "$SRC_DIR" ]; then
+    echo "[ERROR] Source directory not found: $SRC_DIR"
+    exit 1
+fi
+
+# 2. collecting IP in source
+echo "[+] Collecting existing destination IPs..."
+grep -h 'ExecStart' $DST_DIR/udp*.service 2>/dev/null \
+| sed -n 's/.*-r"\([^":]*\).*/\1/p' \
+| sort -u > /tmp/existing_udp_ips.txt
+
+# list all IP
+cp /tmp/existing_udp_ips.txt /tmp/all_seen_udp_ips.txt
+
+# 3. find last number udp
+echo "[+] Detecting last udp service number..."
+LAST=$(ls $DST_DIR/udp*.service 2>/dev/null \
+| sed 's/.*udp\([0-9]*\)\.service/\1/' \
+| sort -n | tail -1)
+
+LAST=${LAST:-0}
+START=$((LAST+1))
+
+echo "[+] New services will start from: udp${START}.service"
+
+IMPORTED_SERVICES=()
+
+# 4. import + rename + filter IP
+for f in $SRC_DIR/udp*.service; do
+    [ -e "$f" ] || continue
+
+    ip=$(sed -n 's/.*-r"\([^":]*\).*/\1/p' "$f")
+
+    if grep -qx "$ip" /tmp/all_seen_udp_ips.txt; then
+        echo "[=] SKIP (duplicate IP): $ip"
+        continue
+    fi
+
+    new="$DST_DIR/udp${START}.service"
+    cp "$f" "$new"
+    echo "$ip" >> /tmp/all_seen_udp_ips.txt
+
+    IMPORTED_SERVICES+=("udp${START}.service")
+    echo "[+] Imported udp${START}.service -> $ip"
+
+    START=$((START+1))
+done
+
+# 5. Reload systemd
+echo "[+] Reloading systemd..."
+systemctl daemon-reexec
+systemctl daemon-reload
+
+# 6. Enable + Start  only new services
+echo "[+] Enabling & starting new services..."
+for s in "${IMPORTED_SERVICES[@]}"; do
+    systemctl enable "$s"
+    systemctl start "$s"
+done
+
+# 7. check new services
+echo "---------- STATUS CHECK ----------"
+
+FAILED_SERVICES=()
+
+for s in "${IMPORTED_SERVICES[@]}"; do
+    state=$(systemctl is-active "$s")
+    if [ "$state" != "active" ]; then
+        FAILED_SERVICES+=("$s")
+        echo "[FAIL] $s is NOT active (state=$state)"
+    else
+        echo "[OK]   $s is active"
+    fi
+done
+
+echo "-----------------------------------"
+
+# 8. final report
+if [ "${#FAILED_SERVICES[@]}" -gt 0 ]; then
+    echo "[WARNING] Some services are NOT running despite all steps:"
+    for f in "${FAILED_SERVICES[@]}"; do
+        echo "  - $f"
+    done
+else
+    echo "[✓] All imported services are active and running."
+fi
+
+echo "=========== UDP IMPORT END ==========="
